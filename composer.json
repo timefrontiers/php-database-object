@@ -3,7 +3,6 @@
   "description": "SQL Database Object trait for Active Record pattern",
   "type": "library",
   "license": "MIT",
-  "version": "1.0.2",
   "keywords": ["php", "database", "orm", "active-record", "sql"],
   "authors": [
     {
