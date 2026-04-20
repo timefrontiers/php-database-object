@@ -264,17 +264,21 @@ echo $post->author();   // "john_doe" (from $session->name)
 
 ## Empty Properties
 
-By default, empty values are skipped during save. Use `$empty_props` to allow specific fields to be empty:
+By default, empty values are skipped during save. Use `$empty_props` to allow specific fields to be empty.
+
+The trait declares `public array $empty_props = []` with an empty default. PHP 8 rejects a class-level redeclaration whose default differs from the trait's (`Fatal error: ... definition differs and is considered incompatible`), so consumers should not redeclare the property — assign the whitelist in the constructor instead:
 
 ```php
 class Article {
   use DatabaseObject;
 
-  public array $empty_props = ['subtitle', 'meta_description'];
-
   public string $title;
-  public string $subtitle = '';  // Can be saved as empty string
-  public ?string $meta_description = null;  // Can be saved as NULL
+  public string $subtitle = '';              // Can be saved as empty string
+  public ?string $meta_description = null;   // Can be saved as NULL
+
+  public function __construct() {
+    $this->empty_props = ['subtitle', 'meta_description'];
+  }
 }
 ```
 
@@ -362,8 +366,11 @@ class Product {
   protected ?string $_updated = null;
   protected ?string $_author = null;
 
-  public array $empty_props = ['description'];
   public ?string $description = null;
+
+  public function __construct() {
+    $this->empty_props = ['description'];  // see "Empty Properties" above
+  }
 
   /**
    * Publish the product.
