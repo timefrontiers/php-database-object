@@ -509,8 +509,11 @@ trait DatabaseObject {
       // Handle by field type
       if ($schema->isBoolean($field)) {
         $sanitized[$field] = $value ? 1 : 0;
-      } elseif ($value === null || ($this->_isEmpty($field, $value) && \in_array($field, $this->empty_props, true))) {
-        // Check if nullable
+      } elseif ($value === null) {
+        // Explicit null always stays null regardless of column type
+        $sanitized[$field] = null;
+      } elseif ($this->_isEmpty($field, $value) && \in_array($field, $this->empty_props, true)) {
+        // Empty (but not null) whitelisted field — coerce to safe default for type
         if ($schema->isDateTime($field) || $schema->isText($field)) {
           $sanitized[$field] = null;
         } elseif ($schema->isNumeric($field)) {
