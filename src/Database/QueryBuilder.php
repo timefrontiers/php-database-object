@@ -257,7 +257,13 @@ class QueryBuilder {
     $params = [];
 
     // SELECT
-    $columns = \implode(', ', \array_map(fn($c) => $c === '*' ? '*' : "`{$c}`", $this->_select));
+    // Quote plain column names but leave SQL expressions (COUNT, aliases, *) as-is
+    $columns = \implode(', ', \array_map(function($c) {
+      if ($c === '*') return '*';
+      // If it contains '(' or ' ' or is already backtick-quoted, it's an expression
+      if (\strpbrk($c, '( `') !== false) return $c;
+      return "`{$c}`";
+    }, $this->_select));
     $sql = "SELECT {$columns} FROM `{$this->_database}`.`{$this->_table}`";
 
     // WHERE
