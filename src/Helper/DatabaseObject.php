@@ -213,9 +213,16 @@ trait DatabaseObject {
    * @return static|false
    */
   public static function findById(int|string $id):static|false {
-    return static::query()
-      ->where(static::$_primary_key, $id)
-      ->first();
+    if (\in_array("code", static::$_db_fields)) {
+      return static::query()
+        ->where(static::$_primary_key, $id)
+        ->orWhere("code", $id)
+        ->first();
+    } else {
+      return static::query()
+        ->where(static::$_primary_key, $id)
+        ->first();
+    }
   }
 
   /**
@@ -237,7 +244,6 @@ trait DatabaseObject {
     $sql = \str_replace([':primary_key:', ':pkey:'], static::$_primary_key, $sql);
 
     $rows = $conn->fetchAll($sql, $params);
-
     if ($rows === false) {
       return false;
     }
