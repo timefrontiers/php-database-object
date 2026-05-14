@@ -154,6 +154,7 @@ trait DatabaseObject {
     $server_name = get_constant("PRJ_SERVER_NAME");
     $db_user = get_dbuser($server_name, $access_group->value);
     $db_server = get_dbserver($server_name);
+    // try to create connection
     try {
       $conn = new SQLDatabase($db_server, $db_user[0], $db_user[1], static::$_table_name, true);
     } catch (\Throwable $th) {
