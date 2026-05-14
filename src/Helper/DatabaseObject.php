@@ -4,9 +4,16 @@ declare(strict_types=1);
 
 namespace TimeFrontiers\Helper;
 
-use TimeFrontiers\SQLDatabase;
+use TimeFrontiers\{SQLDatabase, AccessGroup};
 use TimeFrontiers\Database\QueryBuilder;
 use TimeFrontiers\Database\Schema\TableSchema;
+
+use function TimeFrontiers\{
+  get_constant,
+  get_dbuser,
+  get_dbserver,
+  get_database
+};
 
 /**
  * Database Object trait for Active Record pattern.
@@ -129,6 +136,30 @@ trait DatabaseObject {
     }
 
     throw new \RuntimeException('No database connection available.');
+  }
+  /**
+   * Upgrade db connection
+   */
+  /**
+   * Upgrade db connection from GUEST
+   *
+   * @param SQLDatabase|null $conn
+   * @param AccessGroup $access_group
+   * @return SQLDatabase
+   */
+  protected static function _upgradeConn(SQLDatabase|null $conn = null, AccessGroup $access_group = AccessGroup::USER):SQLDatabase {
+    if ($conn && $conn instanceof SQLDatabase) {
+      if (!\str_ends_with($conn->getUser(), "GUEST")) return $conn;
+    }
+    $server_name = get_constant("PRJ_SERVER_NAME");
+    $db_user = get_dbuser($server_name, $access_group->value);
+    $db_server = get_dbserver($server_name);
+    try {
+      $conn = new SQLDatabase($db_server, $db_user[0], $db_user[1], static::$_table_name, true);
+    } catch (\Throwable $th) {
+      throw new \Exception("Failed to create database connection upgrade: {$th->getMessage()}", 1);
+    }
+    return $conn;
   }
 
   // =========================================================================
