@@ -156,7 +156,7 @@ trait DatabaseObject {
     $db_server = get_dbserver($server_name);
     // try to create connection
     try {
-      $conn = new SQLDatabase($db_server, $db_user[0], $db_user[1], static::$_table_name, true);
+      $conn = new SQLDatabase($db_server, $db_user[0], $db_user[1], static::$_db_name, true);
     } catch (\Throwable $th) {
       throw new \Exception("Failed to create database connection upgrade: {$th->getMessage()}", 1);
     }
