@@ -4,20 +4,20 @@ declare(strict_types=1);
 
 namespace TimeFrontiers\Database;
 
+use TimeFrontiers\Helper\HasErrors;
+use TimeFrontiers\Internal\{ImportsConnectionErrors, SqlIdentifier};
 use TimeFrontiers\SQLDatabase;
 
 /**
- * Simple fluent query builder.
- *
- * Usage:
- *   $users = User::query()
- *     ->where('status', 'active')
- *     ->where('created_at', '>', '2024-01-01')
- *     ->orderBy('name')
- *     ->limit(10)
- *     ->get();
+ * Prepared, identifier-safe fluent query builder.
  */
-class QueryBuilder {
+class QueryBuilder
+{
+  use HasErrors, ImportsConnectionErrors;
+
+  private const OPERATORS = [
+    '=', '!=', '<>', '<', '<=', '>', '>=', 'LIKE', 'NOT LIKE', '<=>',
+  ];
 
   private SQLDatabase $_conn;
   private string $_database;
@@ -26,7 +26,6 @@ class QueryBuilder {
 
   private array $_select = ['*'];
   private array $_where = [];
-  private array $_params = [];
   private array $_order_by = [];
   private ?int $_limit = null;
   private ?int $_offset = null;
@@ -44,294 +43,338 @@ class QueryBuilder {
   }
 
   /**
-   * Set columns to select.
+   * Select plain columns or *. Custom expressions belong in findBySql().
    */
-  public function select(string|array $columns):self {
-    $this->_select = \is_array($columns) ? $columns : \func_get_args();
+  public function select(string|array $columns): self
+  {
+    $selected = \is_array($columns) ? $columns : \func_get_args();
+    if ($selected === []) {
+      throw new \InvalidArgumentException('At least one select column is required.');
+    }
+
+    foreach ($selected as $column) {
+      if (!\is_string($column) || $column === '') {
+        throw new \InvalidArgumentException('Select columns must be plain identifiers or *.');
+      }
+      if ($column !== '*') {
+        SqlIdentifier::quotePath($column);
+      }
+    }
+
+    $this->_select = \array_values($selected);
     return $this;
   }
 
-  /**
-   * Add a where condition.
-   *
-   * @param string $column Column name
-   * @param mixed $operator Operator or value (if 2 args)
-   * @param mixed $value Value (if 3 args)
-   */
-  public function where(string $column, mixed $operator, mixed $value = null):self {
-    if ($value === null) {
-      // Two args: where('status', 'active') means =
+  public function where(string $column, mixed $operator, mixed $value = null): self
+  {
+    if (\func_num_args() === 2) {
       $value = $operator;
       $operator = '=';
     }
 
-    $this->_where[] = [
-      'column' => $column,
-      'operator' => \strtoupper($operator),
-      'value' => $value,
-      'boolean' => 'AND',
-    ];
-
+    $this->_addWhere($column, $operator, $value, 'AND');
     return $this;
   }
 
-  /**
-   * Add an OR where condition.
-   */
-  public function orWhere(string $column, mixed $operator, mixed $value = null):self {
-    if ($value === null) {
+  public function orWhere(string $column, mixed $operator, mixed $value = null): self
+  {
+    if (\func_num_args() === 2) {
       $value = $operator;
       $operator = '=';
     }
 
-    $this->_where[] = [
-      'column' => $column,
-      'operator' => \strtoupper($operator),
-      'value' => $value,
-      'boolean' => 'OR',
-    ];
-
+    $this->_addWhere($column, $operator, $value, 'OR');
     return $this;
   }
 
-  /**
-   * Add a WHERE IN condition.
-   */
-  public function whereIn(string $column, array $values):self {
-    $this->_where[] = [
-      'column' => $column,
-      'operator' => 'IN',
-      'value' => $values,
-      'boolean' => 'AND',
-    ];
-
+  public function whereIn(string $column, array $values): self
+  {
+    $this->_addSetWhere($column, 'IN', $values, 'AND');
     return $this;
   }
 
-  /**
-   * Add a WHERE NOT IN condition.
-   */
-  public function whereNotIn(string $column, array $values):self {
-    $this->_where[] = [
-      'column' => $column,
-      'operator' => 'NOT IN',
-      'value' => $values,
-      'boolean' => 'AND',
-    ];
-
+  public function whereNotIn(string $column, array $values): self
+  {
+    $this->_addSetWhere($column, 'NOT IN', $values, 'AND');
     return $this;
   }
 
-  /**
-   * Add a WHERE NULL condition.
-   */
-  public function whereNull(string $column):self {
-    $this->_where[] = [
-      'column' => $column,
-      'operator' => 'IS NULL',
-      'value' => null,
-      'boolean' => 'AND',
-    ];
-
+  public function whereNull(string $column): self
+  {
+    $this->_addNullWhere($column, 'IS NULL', 'AND');
     return $this;
   }
 
-  /**
-   * Add a WHERE NOT NULL condition.
-   */
-  public function whereNotNull(string $column):self {
-    $this->_where[] = [
-      'column' => $column,
-      'operator' => 'IS NOT NULL',
-      'value' => null,
-      'boolean' => 'AND',
-    ];
-
+  public function whereNotNull(string $column): self
+  {
+    $this->_addNullWhere($column, 'IS NOT NULL', 'AND');
     return $this;
   }
 
-  /**
-   * Add ORDER BY clause.
-   */
-  public function orderBy(string $column, string $direction = 'ASC'):self {
+  public function orderBy(string $column, string $direction = 'ASC'): self
+  {
+    SqlIdentifier::quotePath($column);
+    $direction = \strtoupper($direction);
+    if (!\in_array($direction, ['ASC', 'DESC'], true)) {
+      throw new \InvalidArgumentException('Order direction must be ASC or DESC.');
+    }
+
     $this->_order_by[] = [
       'column' => $column,
-      'direction' => \strtoupper($direction) === 'DESC' ? 'DESC' : 'ASC',
+      'direction' => $direction,
     ];
 
     return $this;
   }
 
-  /**
-   * Add ORDER BY DESC.
-   */
-  public function orderByDesc(string $column):self {
+  public function orderByDesc(string $column): self
+  {
     return $this->orderBy($column, 'DESC');
   }
 
-  /**
-   * Set LIMIT.
-   */
-  public function limit(int $limit):self {
-    $this->_limit = $limit;
-    return $this;
-  }
-
-  /**
-   * Set OFFSET.
-   */
-  public function offset(int $offset):self {
-    $this->_offset = $offset;
-    return $this;
-  }
-
-  /**
-   * Shorthand for limit + offset.
-   */
-  public function take(int $limit, int $offset = 0):self {
-    $this->_limit = $limit;
-    $this->_offset = $offset;
-    return $this;
-  }
-
-  /**
-   * Execute and get all results.
-   *
-   * @return array Array of entity instances
-   */
-  public function get():array {
-    [$sql, $params] = $this->_buildSelect();
-
-    $rows = $this->_conn->fetchAll($sql, $params);
-
-    if (empty($rows)) {
-      return [];
+  public function limit(int $limit): self
+  {
+    if ($limit < 0) {
+      throw new \InvalidArgumentException('Limit cannot be negative.');
     }
 
-    return $this->_hydrateMany($rows);
+    $this->_limit = $limit;
+    return $this;
+  }
+
+  public function offset(int $offset): self
+  {
+    if ($offset < 0) {
+      throw new \InvalidArgumentException('Offset cannot be negative.');
+    }
+
+    $this->_offset = $offset;
+    return $this;
+  }
+
+  public function take(int $limit, int $offset = 0): self
+  {
+    return $this->limit($limit)->offset($offset);
   }
 
   /**
-   * Execute and get first result.
-   *
-   * @return object|false Entity instance or false if not found
+   * @return array<object>|false
    */
-  public function first():object|false {
-    $this->_limit = 1;
-    $results = $this->get();
+  public function get(): array|false
+  {
+    [$sql, $params] = $this->_buildSelect();
+    return $this->_fetchMany($sql, $params, 'get');
+  }
+
+  public function first(): object|false
+  {
+    [$sql, $params] = $this->_buildSelect(limit_override: 1);
+    $results = $this->_fetchMany($sql, $params, 'first');
+
+    if ($results === false) {
+      return false;
+    }
 
     return $results[0] ?? false;
   }
 
-  /**
-   * Get count of matching records.
-   */
-  public function count():int {
-    $this->_select = ['COUNT(*) AS cnt'];
-    [$sql, $params] = $this->_buildSelect();
+  public function count(): int|false
+  {
+    return $this->_runCount('count');
+  }
 
-    $row = $this->_conn->fetchOne($sql, $params);
-
-    return (int) ($row['cnt'] ?? 0);
+  public function exists(): bool
+  {
+    $count = $this->_runCount('exists');
+    return $count !== false && $count > 0;
   }
 
   /**
-   * Check if any records exist.
+   * @return array{string, array}
    */
-  public function exists():bool {
-    return $this->count() > 0;
-  }
-
-  /**
-   * Get the generated SQL (for debugging).
-   */
-  public function toSql():array {
+  public function toSql(): array
+  {
     return $this->_buildSelect();
   }
 
-  // =========================================================================
-  // Private Methods
-  // =========================================================================
+  private function _addWhere(
+    string $column,
+    mixed $operator,
+    mixed $value,
+    string $boolean
+  ): void {
+    SqlIdentifier::quotePath($column);
+    if (!\is_string($operator)) {
+      throw new \InvalidArgumentException('Query operator must be a string.');
+    }
 
-  private function _buildSelect():array {
+    $operator = \strtoupper(\trim($operator));
+    if (!\in_array($operator, self::OPERATORS, true)) {
+      throw new \InvalidArgumentException('Unsupported query operator.');
+    }
+
+    $this->_where[] = [
+      'column' => $column,
+      'operator' => $operator,
+      'value' => $value,
+      'boolean' => $boolean,
+    ];
+  }
+
+  private function _addSetWhere(
+    string $column,
+    string $operator,
+    array $values,
+    string $boolean
+  ): void {
+    SqlIdentifier::quotePath($column);
+    $this->_where[] = [
+      'column' => $column,
+      'operator' => $operator,
+      'value' => $values,
+      'boolean' => $boolean,
+    ];
+  }
+
+  private function _addNullWhere(string $column, string $operator, string $boolean): void
+  {
+    SqlIdentifier::quotePath($column);
+    $this->_where[] = [
+      'column' => $column,
+      'operator' => $operator,
+      'value' => null,
+      'boolean' => $boolean,
+    ];
+  }
+
+  /**
+   * @return array{string, array}
+   */
+  private function _buildSelect(
+    ?string $trusted_select = null,
+    bool $include_order = true,
+    bool $ignore_stored_pagination = false,
+    ?int $limit_override = null
+  ): array {
     $params = [];
+    $columns = $trusted_select ?? \implode(', ', \array_map(
+      fn(string $column): string => $column === '*'
+        ? '*'
+        : SqlIdentifier::quotePath($column),
+      $this->_select
+    ));
+    $table = SqlIdentifier::quoteTable($this->_database, $this->_table);
+    $sql = "SELECT {$columns} FROM {$table}";
 
-    // SELECT
-    // Quote plain column names but leave SQL expressions (COUNT, aliases, *) as-is
-    $columns = \implode(', ', \array_map(function($c) {
-      if ($c === '*') return '*';
-      // If it contains '(' or ' ' or is already backtick-quoted, it's an expression
-      if (\strpbrk($c, '( `') !== false) return $c;
-      return "`{$c}`";
-    }, $this->_select));
-    $sql = "SELECT {$columns} FROM `{$this->_database}`.`{$this->_table}`";
-
-    // WHERE
-    if (!empty($this->_where)) {
-      $sql .= ' WHERE ';
+    if ($this->_where !== []) {
       $conditions = [];
 
-      foreach ($this->_where as $i => $clause) {
-        $condition = '';
+      foreach ($this->_where as $index => $clause) {
+        $condition = $index > 0 ? $clause['boolean'] . ' ' : '';
+        $values = $clause['value'];
 
-        if ($i > 0) {
-          $condition .= $clause['boolean'] . ' ';
-        }
-
-        $column = "`{$clause['column']}`";
-
-        switch ($clause['operator']) {
-          case 'IN':
-          case 'NOT IN':
-            $placeholders = \implode(', ', \array_fill(0, \count($clause['value']), '?'));
+        if ($clause['operator'] === 'IN' || $clause['operator'] === 'NOT IN') {
+          if ($values === []) {
+            $condition .= $clause['operator'] === 'IN' ? '0 = 1' : '1 = 1';
+          } else {
+            $column = SqlIdentifier::quotePath($clause['column']);
+            $placeholders = \implode(', ', \array_fill(0, \count($values), '?'));
             $condition .= "{$column} {$clause['operator']} ({$placeholders})";
-            $params = \array_merge($params, $clause['value']);
-            break;
-
-          case 'IS NULL':
-          case 'IS NOT NULL':
-            $condition .= "{$column} {$clause['operator']}";
-            break;
-
-          default:
-            $condition .= "{$column} {$clause['operator']} ?";
-            $params[] = $clause['value'];
-            break;
+            $params = \array_merge($params, $values);
+          }
+        } elseif ($clause['operator'] === 'IS NULL' || $clause['operator'] === 'IS NOT NULL') {
+          $column = SqlIdentifier::quotePath($clause['column']);
+          $condition .= "{$column} {$clause['operator']}";
+        } else {
+          $column = SqlIdentifier::quotePath($clause['column']);
+          $condition .= "{$column} {$clause['operator']} ?";
+          $params[] = $values;
         }
 
         $conditions[] = $condition;
       }
 
-      $sql .= \implode(' ', $conditions);
+      $sql .= ' WHERE ' . \implode(' ', $conditions);
     }
 
-    // ORDER BY
-    if (!empty($this->_order_by)) {
+    if ($include_order && $this->_order_by !== []) {
       $orders = \array_map(
-        fn($o) => "`{$o['column']}` {$o['direction']}",
+        fn(array $order): string =>
+          SqlIdentifier::quotePath($order['column']) . ' ' . $order['direction'],
         $this->_order_by
       );
       $sql .= ' ORDER BY ' . \implode(', ', $orders);
     }
 
-    // LIMIT
-    if ($this->_limit !== null) {
-      $sql .= " LIMIT {$this->_limit}";
+    $limit = $ignore_stored_pagination ? $limit_override : ($limit_override ?? $this->_limit);
+    $offset = $ignore_stored_pagination ? null : $this->_offset;
 
-      if ($this->_offset !== null) {
-        $sql .= " OFFSET {$this->_offset}";
+    if ($limit !== null) {
+      $sql .= " LIMIT {$limit}";
+      if ($offset !== null) {
+        $sql .= " OFFSET {$offset}";
       }
     }
 
     return [$sql, $params];
   }
 
-  private function _hydrateMany(array $rows):array {
+  /**
+   * @return array<object>|false
+   */
+  private function _fetchMany(string $sql, array $params, string $context): array|false
+  {
+    $error_snapshot = $this->_snapshotConnectionErrors($this->_conn);
+    $rows = $this->_conn->fetchAll($sql, $params);
+
+    if ($rows === false) {
+      $this->_importConnectionErrorDelta($this->_conn, $error_snapshot, $context);
+      return false;
+    }
+
+    if ($rows === []) {
+      return [];
+    }
+
+    return $this->_hydrateMany($rows);
+  }
+
+  private function _runCount(string $context): int|false
+  {
+    [$sql, $params] = $this->_buildSelect(
+      trusted_select: 'COUNT(*) AS cnt',
+      include_order: false,
+      ignore_stored_pagination: true
+    );
+    $error_snapshot = $this->_snapshotConnectionErrors($this->_conn);
+    $row = $this->_conn->fetchOne($sql, $params);
+
+    if ($row === false) {
+      $this->_importConnectionErrorDelta($this->_conn, $error_snapshot, $context);
+      return false;
+    }
+
+    $count = \filter_var(
+      $row['cnt'] ?? null,
+      \FILTER_VALIDATE_INT,
+      ['options' => ['min_range' => 0]]
+    );
+
+    if ($count === false) {
+      $this->_systemError($context, 'Database count query returned an invalid result.');
+      return false;
+    }
+
+    return $count;
+  }
+
+  private function _hydrateMany(array $rows): array
+  {
     $entities = [];
     $class = $this->_entity_class;
 
     foreach ($rows as $row) {
-      $entities[] = $class::_instantiateFromRow($row);
+      $entities[] = $class::_instantiateFromRow($row, $this->_conn);
     }
 
     return $entities;

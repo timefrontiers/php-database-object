@@ -4,17 +4,20 @@ declare(strict_types=1);
 
 namespace TimeFrontiers\Database\Schema;
 
+use TimeFrontiers\Exceptions\SchemaException;
+use TimeFrontiers\Internal\SqlIdentifier;
 use TimeFrontiers\SQLDatabase;
 
 /**
  * Cached table schema information.
  *
- * Fetches and caches field names, types, and sizes from the database
- * to avoid repeated INFORMATION_SCHEMA queries.
+ * Metadata is isolated by the concrete wrapped connection so workers may use
+ * identically named databases on different servers without sharing schemas.
  */
-class TableSchema {
-
-  private static array $_cache = [];
+class TableSchema
+{
+  /** @var \WeakMap<object, array<string, array<string, array>>>|null */
+  private static ?\WeakMap $_cache = null;
 
   private string $_database;
   private string $_table;
@@ -32,32 +35,33 @@ class TableSchema {
     $this->_database = $database;
     $this->_table = $table;
 
-    $cache_key = "{$database}.{$table}";
+    $identity = $conn->getInstance();
+    $entry = self::_cacheEntry($identity, $database, $table);
 
-    if (isset(self::$_cache[$cache_key])) {
-      $cached = self::$_cache[$cache_key];
-      $this->_fields = $cached['fields'];
-      $this->_field_types = $cached['types'];
-      $this->_field_sizes = $cached['sizes'];
-      $this->_primary_key = $primary_key ?? $cached['primary_key'];
-    } else {
-      $this->_loadSchema($conn);
+    if ($entry === null) {
+      $entry = $this->_loadSchema($conn);
+
       if ($primary_key === null) {
-        $this->_loadPrimaryKey($conn);
-      } else {
-        $this->_primary_key = $primary_key;
+        $entry['primary_key'] = $this->_loadPrimaryKey($conn);
       }
 
-      self::$_cache[$cache_key] = [
-        'fields' => $this->_fields,
-        'types' => $this->_field_types,
-        'sizes' => $this->_field_sizes,
-        'primary_key' => $this->_primary_key,
-      ];
+      self::_storeCacheEntry($identity, $database, $table, $entry);
+    } elseif ($primary_key === null && $entry['primary_key'] === null) {
+      $entry['primary_key'] = $this->_loadPrimaryKey($conn);
+      self::_storeCacheEntry($identity, $database, $table, $entry);
     }
+
+    $this->_fields = $entry['fields'];
+    $this->_field_types = $entry['types'];
+    $this->_field_sizes = $entry['sizes'];
+    $this->_primary_key = $primary_key ?? $entry['primary_key'];
   }
 
-  private function _loadSchema(SQLDatabase $conn):void {
+  /**
+   * @return array{fields: list<string>, types: array<string, string>, sizes: array<string, int|null>, primary_key: null}
+   */
+  private function _loadSchema(SQLDatabase $conn): array
+  {
     $rows = $conn->fetchAll(
       "SELECT COLUMN_NAME, DATA_TYPE, CHARACTER_MAXIMUM_LENGTH
        FROM INFORMATION_SCHEMA.COLUMNS
@@ -65,104 +69,177 @@ class TableSchema {
       [$this->_database, $this->_table]
     );
 
-    foreach ($rows as $row) {
-      $field = $row['COLUMN_NAME'];
-      $this->_fields[] = $field;
-      $this->_field_types[$field] = \strtoupper($row['DATA_TYPE']);
-      $this->_field_sizes[$field] = $row['CHARACTER_MAXIMUM_LENGTH'] !== null
-        ? (int) $row['CHARACTER_MAXIMUM_LENGTH']
-        : null;
+    if ($rows === false || $rows === []) {
+      throw new SchemaException('Table schema could not be discovered.');
     }
+
+    $fields = [];
+    $types = [];
+    $sizes = [];
+
+    foreach ($rows as $row) {
+      if (
+        !\is_array($row)
+        || !isset($row['COLUMN_NAME'], $row['DATA_TYPE'])
+        || !\is_string($row['COLUMN_NAME'])
+        || $row['COLUMN_NAME'] === ''
+        || !\is_string($row['DATA_TYPE'])
+        || $row['DATA_TYPE'] === ''
+      ) {
+        throw new SchemaException('Table schema metadata was incomplete.');
+      }
+
+      $field = $row['COLUMN_NAME'];
+      $fields[] = $field;
+      $types[$field] = \strtoupper($row['DATA_TYPE']);
+      $size = $row['CHARACTER_MAXIMUM_LENGTH'] ?? null;
+      $sizes[$field] = $size !== null ? (int)$size : null;
+    }
+
+    return [
+      'fields' => $fields,
+      'types' => $types,
+      'sizes' => $sizes,
+      'primary_key' => null,
+    ];
   }
 
-  private function _loadPrimaryKey(SQLDatabase $conn):void {
-    $row = $conn->fetchOne(
-      "SHOW INDEX FROM `{$this->_database}`.`{$this->_table}` WHERE Key_name = 'PRIMARY'"
-    );
+  private function _loadPrimaryKey(SQLDatabase $conn): string
+  {
+    $table = SqlIdentifier::quoteTable($this->_database, $this->_table);
+    $row = $conn->fetchOne("SHOW INDEX FROM {$table} WHERE Key_name = 'PRIMARY'");
 
-    $this->_primary_key = $row['Column_name'] ?? 'id';
+    if (
+      $row === false
+      || !isset($row['Column_name'])
+      || !\is_string($row['Column_name'])
+      || $row['Column_name'] === ''
+    ) {
+      throw new SchemaException('Table primary key could not be discovered.');
+    }
+
+    return $row['Column_name'];
   }
 
-  public function getDatabase():string {
+  public function getDatabase(): string
+  {
     return $this->_database;
   }
 
-  public function getTable():string {
+  public function getTable(): string
+  {
     return $this->_table;
   }
 
-  public function getPrimaryKey():string {
+  public function getPrimaryKey(): string
+  {
     return $this->_primary_key;
   }
 
-  public function getFields():array {
+  public function getFields(): array
+  {
     return $this->_fields;
   }
 
-  public function getFieldType(string $field):?string {
+  public function getFieldType(string $field): ?string
+  {
     return $this->_field_types[$field] ?? null;
   }
 
-  public function getFieldSize(string $field):?int {
+  public function getFieldSize(string $field): ?int
+  {
     return $this->_field_sizes[$field] ?? null;
   }
 
-  public function hasField(string $field):bool {
+  public function hasField(string $field): bool
+  {
     return \in_array($field, $this->_fields, true);
   }
 
-  /**
-   * Check if a field is a numeric type.
-   */
-  public function isNumeric(string $field):bool {
+  public function isNumeric(string $field): bool
+  {
     $type = $this->_field_types[$field] ?? '';
     return \in_array($type, [
       'BIT', 'TINYINT', 'BOOLEAN', 'SMALLINT', 'MEDIUMINT',
-      'INT', 'INTEGER', 'BIGINT', 'FLOAT', 'DOUBLE', 'DECIMAL', 'DEC'
+      'INT', 'INTEGER', 'BIGINT', 'FLOAT', 'DOUBLE', 'DECIMAL', 'DEC',
     ], true);
   }
 
-  /**
-   * Check if a field is a date/time type.
-   */
-  public function isDateTime(string $field):bool {
+  public function isDateTime(string $field): bool
+  {
     $type = $this->_field_types[$field] ?? '';
     return \in_array($type, ['DATE', 'DATETIME', 'TIMESTAMP', 'TIME', 'YEAR'], true);
   }
 
-  /**
-   * Check if a field is a text type.
-   */
-  public function isText(string $field):bool {
+  public function isText(string $field): bool
+  {
     $type = $this->_field_types[$field] ?? '';
     return \in_array($type, [
       'CHAR', 'VARCHAR', 'BLOB', 'TEXT', 'TINYBLOB', 'TINYTEXT',
-      'MEDIUMBLOB', 'MEDIUMTEXT', 'LONGBLOB', 'LONGTEXT', 'ENUM', 'JSON'
+      'MEDIUMBLOB', 'MEDIUMTEXT', 'LONGBLOB', 'LONGTEXT', 'ENUM', 'JSON',
     ], true);
   }
 
-  /**
-   * Check if a field is a boolean-like type.
-   */
-  public function isBoolean(string $field):bool {
+  public function isBoolean(string $field): bool
+  {
     $type = $this->_field_types[$field] ?? '';
     return \in_array($type, ['BIT', 'TINYINT', 'BOOLEAN'], true);
   }
 
-  /**
-   * Clear the schema cache.
-   */
-  public static function clearCache(?string $database = null, ?string $table = null):void {
+  public static function clearCache(?string $database = null, ?string $table = null): void
+  {
+    if (self::$_cache === null) {
+      return;
+    }
+
     if ($database === null) {
-      self::$_cache = [];
-    } elseif ($table === null) {
-      foreach (\array_keys(self::$_cache) as $key) {
-        if (\str_starts_with($key, "{$database}.")) {
-          unset(self::$_cache[$key]);
+      self::$_cache = new \WeakMap();
+      return;
+    }
+
+    $identities = [];
+    foreach (self::$_cache as $identity => $_databases) {
+      $identities[] = $identity;
+    }
+
+    foreach ($identities as $identity) {
+      $databases = self::$_cache[$identity];
+      if (!isset($databases[$database])) {
+        continue;
+      }
+
+      if ($table === null) {
+        unset($databases[$database]);
+      } else {
+        unset($databases[$database][$table]);
+        if ($databases[$database] === []) {
+          unset($databases[$database]);
         }
       }
-    } else {
-      unset(self::$_cache["{$database}.{$table}"]);
+
+      if ($databases === []) {
+        unset(self::$_cache[$identity]);
+      } else {
+        self::$_cache[$identity] = $databases;
+      }
     }
+  }
+
+  private static function _cacheEntry(object $identity, string $database, string $table): ?array
+  {
+    self::$_cache ??= new \WeakMap();
+    return self::$_cache[$identity][$database][$table] ?? null;
+  }
+
+  private static function _storeCacheEntry(
+    object $identity,
+    string $database,
+    string $table,
+    array $entry
+  ): void {
+    self::$_cache ??= new \WeakMap();
+    $databases = self::$_cache[$identity] ?? [];
+    $databases[$database][$table] = $entry;
+    self::$_cache[$identity] = $databases;
   }
 }

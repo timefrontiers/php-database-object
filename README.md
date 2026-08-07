@@ -1,424 +1,228 @@
 # TimeFrontiers PHP Database Object
 
-Database Object trait for Active Record pattern with query builder support.
+Active Record infrastructure for SQL Database 1.1, with schema-aware writes,
+prepared fluent queries, explicit connection injection, and ecosystem-standard
+`HasErrors` diagnostics.
 
-[![PHP Version](https://img.shields.io/badge/php-%3E%3D8.1-8892BF.svg)](https://php.net/)
+[![PHP Version](https://img.shields.io/badge/php-%3E%3D8.4-8892BF.svg)](https://php.net/)
+[![Release](https://img.shields.io/badge/release-1.1.0-blue.svg)](CHANGELOG.md)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-
-## Installation
-
-```bash
-composer require timefrontiers/php-database-object
-```
 
 ## Requirements
 
-- PHP 8.1+
-- `timefrontiers/php-sql-database` ^1.0
-- `timefrontiers/php-has-errors` ^1.0
+- PHP 8.4+
+- `timefrontiers/php-core` 1.x
+- `timefrontiers/php-has-errors` 1.x
+- `timefrontiers/php-sql-database` 1.1.x
 
-## Quick Start
+Install the package with Composer:
+
+```bash
+composer require timefrontiers/php-database-object:^1.1
+```
+
+## Model definition
+
+`DatabaseObject` is a trait and already includes `HasErrors`:
 
 ```php
 use TimeFrontiers\Helper\DatabaseObject;
-use TimeFrontiers\Helper\HasErrors;
 
-class User {
-  use DatabaseObject, HasErrors;
-
-  protected static string $_db_name = 'myapp';
-  protected static string $_table_name = 'users';
-  protected static string $_primary_key = 'id';
-  protected static array $_db_fields = []; // Auto-loaded from schema
-
-  public int $id;
-  public string $name;
-  public string $email;
-  public string $status = 'active';
-  protected ?string $_created = null;
-  protected ?string $_updated = null;
-  protected ?string $_author = null;
-}
-
-// Find by ID
-$user = User::findById(123);
-
-// Query builder
-$activeUsers = User::query()
-  ->where('status', 'active')
-  ->orderBy('name')
-  ->limit(10)
-  ->get();
-
-// Create
-$user = new User();
-$user->name = 'John Doe';
-$user->email = 'john@example.com';
-$user->save();
-
-// Update
-$user->name = 'Jane Doe';
-$user->save();
-
-// Delete
-$user->delete();
-```
-
-## Connection Management
-
-Three levels of connection resolution:
-
-```php
-// 1. Instance-level (highest priority)
-$user = new User();
-$user->setConnection($conn);
-
-// 2. Class-level
-User::useConnection($conn);
-
-// 3. Global fallback (lowest priority)
-global $database;
-$database = new SQLDatabase(...);
-```
-
-## Required Static Properties
-
-```php
-class MyEntity {
+final class UserRecord
+{
   use DatabaseObject;
 
-  // Required
-  protected static string $_db_name = 'database_name';
-  protected static string $_table_name = 'table_name';
+  protected static string $_db_name = 'application';
+  protected static string $_table_name = 'users';
   protected static string $_primary_key = 'id';
+  protected static array $_db_fields = []; // Discovered when first needed.
 
-  // Optional (auto-loaded from INFORMATION_SCHEMA if empty)
-  protected static array $_db_fields = [];
+  public ?int $id = null;
+  public string $code = '';
+  public string $name = '';
 }
 ```
 
-## Query Builder
+Models resolve connections in this compatibility order:
 
-### Basic Queries
+1. The connection supplied through `setConnection()`.
+2. The class connection supplied through `useConnection()`.
+3. Linktude's global `$database` facade.
+
+Explicit injection is preferred, especially inside transactions:
 
 ```php
-// Find all
-$users = User::findAll();
+UserRecord::useConnection($database);
 
-// Find by ID
-$user = User::findById(123);
+$record = new UserRecord();
+$record->setConnection($database);
+$record->code = 'USER-1042';
+$record->name = 'Example';
 
-// Count
-$count = User::countAll();
-
-// Check existence
-$exists = User::valueExists('email', 'john@example.com');
+if (!$record->save()) {
+  $errors = $record->getErrors();
+}
 ```
 
-### Fluent Queries
+Hydrated records retain the exact facade that performed the read. A later
+`save()` or `delete()` therefore stays on the caller's transaction-bound
+connection even if static or global state changes.
+
+## Writes and errors
+
+`save()` inserts when the primary key is empty and updates when it is populated.
+A preassigned-key insert must use explicit repository SQL because a populated
+key always routes to update.
+
+SQL Database 1.1 operational failures return `false`. Database Object checks
+that result and imports only the connection errors appended by the current
+operation into `_create`, `_update`, or `_delete`.
 
 ```php
-// WHERE conditions
-User::query()
-  ->where('status', 'active')           // status = 'active'
-  ->where('age', '>', 18)               // age > 18
-  ->where('role', '!=', 'admin')        // role != 'admin'
-  ->get();
+if (!$record->save()) {
+  $message = $record->firstError('_create');
+  $all = $record->getErrors();
+}
+```
 
-// OR conditions
-User::query()
+The behavior is deliberate:
+
+- Create succeeds only after a successful insert statement.
+- An ordinary successful update may return true with zero affected rows.
+- Delete succeeds only after a successful statement affecting exactly one row.
+- Model errors preserve the five-element tuple `[rank, code, message, file, line]`.
+
+Exact-one-row updates, optimistic versions, row locks, immutable inserts, and
+multi-row state transitions belong in repository SQL, not Active Record
+`save()`.
+
+## Fluent queries
+
+```php
+$query = UserRecord::query()
+  ->select('id', 'code', 'name')
   ->where('status', 'active')
-  ->orWhere('role', 'admin')
-  ->get();
-
-// IN / NOT IN
-User::query()
-  ->whereIn('status', ['active', 'pending'])
-  ->whereNotIn('role', ['banned', 'suspended'])
-  ->get();
-
-// NULL checks
-User::query()
-  ->whereNull('deleted_at')
-  ->whereNotNull('verified_at')
-  ->get();
-
-// Ordering
-User::query()
+  ->where('created_at', '>=', '2026-01-01')
+  ->whereNotIn('role', ['blocked'])
   ->orderBy('name')
-  ->orderByDesc('created_at')
-  ->get();
+  ->limit(25);
 
-// Pagination
-User::query()
-  ->limit(10)
-  ->offset(20)
-  ->get();
-
-// Or use take()
-User::query()->take(10, 20)->get();
-
-// First result
-$user = User::query()
-  ->where('email', 'john@example.com')
-  ->first();
-
-// Count matching
-$count = User::query()
-  ->where('status', 'active')
-  ->count();
-
-// Check existence
-$exists = User::query()
-  ->where('email', 'john@example.com')
-  ->exists();
+$users = $query->get();
+if ($users === false) {
+  $errors = $query->getErrors();
+}
 ```
 
-### Custom SQL
+The builder binds values and accepts plain identifiers only. Supported general
+operators are `=`, `!=`, `<>`, `<`, `<=`, `>`, `>=`, `LIKE`, `NOT LIKE`, and
+`<=>`. Use `whereNull()`, `whereNotNull()`, `whereIn()`, and `whereNotIn()` for
+their dedicated cases.
 
-Use placeholders for database/table names:
+Empty `IN` matches nothing; empty `NOT IN` matches everything. Negative limits
+and offsets, unsupported operators, raw select expressions, and invalid
+identifiers throw `InvalidArgumentException` before execution.
+
+Result contracts are:
+
+| Method | Success with no match | Database failure |
+|---|---:|---:|
+| `get()` | `[]` | `false` |
+| `first()` | `false` | `false` with builder errors |
+| `count()` | `0` | `false` |
+| `exists()` | `false` | `false` with builder errors |
+
+Use strict comparisons: `[] !== false` and `0 !== false`. `count()`, `exists()`,
+and `first()` do not mutate the builder's select or pagination state.
+
+## Reviewed custom SQL
+
+Expression-heavy or otherwise custom developer-authored SQL remains available
+through `findBySql()`:
 
 ```php
-$users = User::findBySql(
-  "SELECT * FROM :database:.:table:
-   WHERE status = ? AND created_at > ?
-   ORDER BY :primary_key: DESC",
-  ['active', '2024-01-01']
+$records = UserRecord::findBySql(
+  'SELECT COUNT(*) AS total, status FROM :db:.:table: ' .
+  'WHERE created_at >= ? GROUP BY status',
+  ['2026-01-01']
 );
 ```
 
-| Placeholder | Replaced With |
-|-------------|---------------|
-| `:database:` or `:db:` | `$_db_name` |
-| `:table:` or `:tbl:` | `$_table_name` |
-| `:primary_key:` or `:pkey:` | `$_primary_key` |
+The `:database:`/`:db:`, `:table:`/`:tbl:`, and
+`:primary_key:`/`:pkey:` placeholders are replaced with quoted model
+identifiers. Values still belong in prepared parameters.
 
-## CRUD Operations
+## Caller-owned transactions
 
-### Create
-
-```php
-$user = new User();
-$user->name = 'John Doe';
-$user->email = 'john@example.com';
-
-if ($user->save()) {
-  echo "Created with ID: {$user->id}";
-} else {
-  $errors = $user->getErrors();
-}
-```
-
-### Update
+Database Object never begins, commits, rolls back, closes, changes, or upgrades
+a connection during persistence, hydration, or schema discovery.
 
 ```php
-$user = User::findById(123);
-$user->name = 'Jane Doe';
+$database->transaction(function (SQLDatabase $database): void {
+  InvoiceRecord::useConnection($database);
 
-if (!$user->save()) {
-  $errors = $user->getErrors();
-}
-```
+  $record = new InvoiceRecord();
+  $record->setConnection($database);
+  // Assign ordinary infrastructure fields.
 
-### Delete
-
-```php
-$user = User::findById(123);
-
-if (!$user->delete()) {
-  $errors = $user->getErrors();
-}
-```
-
-## Timestamps & Author
-
-The trait automatically handles these fields if they exist:
-
-| Property | Behavior |
-|----------|----------|
-| `$_created` | Set to current datetime on insert |
-| `$_updated` | Set to current datetime on insert/update |
-| `$_author` | Set from `$session->name` on insert |
-
-```php
-class Post {
-  use DatabaseObject;
-
-  protected ?string $_created = null;
-  protected ?string $_updated = null;
-  protected ?string $_author = null;
-
-  // Accessors
-  public function created():?string { ... }  // Built-in
-  public function updated():?string { ... }  // Built-in
-  public function author():?string { ... }   // Built-in
-}
-
-$post = new Post();
-$post->title = 'Hello';
-$post->save();
-
-echo $post->created();  // "2024-01-15 10:30:00"
-echo $post->author();   // "john_doe" (from $session->name)
-```
-
-## Empty Properties
-
-By default, empty values are skipped during save. Use `$empty_props` to allow specific fields to be empty.
-
-The trait declares `public array $empty_props = []` with an empty default. PHP 8 rejects a class-level redeclaration whose default differs from the trait's (`Fatal error: ... definition differs and is considered incompatible`), so consumers should not redeclare the property — assign the whitelist in the constructor instead:
-
-```php
-class Article {
-  use DatabaseObject;
-
-  public string $title;
-  public string $subtitle = '';              // Can be saved as empty string
-  public ?string $meta_description = null;   // Can be saved as NULL
-
-  public function __construct() {
-    $this->empty_props = ['subtitle', 'meta_description'];
+  if (!$record->save()) {
+    // Translate model/connection errors at the repository boundary.
+    throw new PersistenceException('Invoice record could not be saved.');
   }
-}
+});
 ```
 
-## Schema Caching
+The caller owns the transaction. Returning false from a SQL Database callback
+does not request rollback, so a model failure must be checked and translated to
+an exception when rollback is required. Commit failures and uncertain outcomes
+belong to the repository/application reconciliation policy; this package does
+not retry them.
 
-Field information is cached from `INFORMATION_SCHEMA` to avoid repeated queries:
+External providers, mail, wallets, files, and queues stay outside the database
+callback. Billing locks, version checks, immutable financial records, and exact
+affected-row transitions remain explicit repository operations.
+
+## Schema caching
+
+Field metadata is cached by the wrapped driver object's identity plus database
+and table. Identically named tables on different servers or connections do not
+share metadata, failed discovery is never cached, and explicit primary-key
+overrides do not alter cached table metadata.
 
 ```php
 use TimeFrontiers\Database\Schema\TableSchema;
 
-// Clear cache for a specific table
-TableSchema::clearCache('myapp', 'users');
-
-// Clear cache for entire database
-TableSchema::clearCache('myapp');
-
-// Clear all cached schemas
+TableSchema::clearCache('application', 'users');
+TableSchema::clearCache('application');
 TableSchema::clearCache();
 ```
 
-## Error Handling
+## Linktude connection upgrade compatibility
 
-The trait uses `HasErrors` for error management:
+The protected `_upgradeConn()` helper remains for legacy Linktude models. It
+requires the global `get_constant`, `get_dbuser`, and `get_dbserver` bootstrap
+helpers. It returns an existing non-guest connection unchanged and refuses to
+replace a guest connection during an active managed transaction. Repositories
+should acquire the required connection before beginning and should not call
+this helper.
 
-```php
-$user = new User();
-$user->email = 'invalid';
+## Tests
 
-if (!$user->save()) {
-  // Get all errors
-  $errors = $user->getErrors();
-
-  // Check specific context
-  if ($user->hasErrors('_create')) {
-    // Handle creation errors
-  }
-
-  // Get first error message
-  $message = $user->firstError('_create');
-
-  // Use with InstanceError for rank-based filtering
-  $visibleErrors = (new InstanceError($user))->get('_create');
-}
+```bash
+composer test-unit
+composer test-mysqli
+composer test-pdo
+composer test-transaction
+composer test-integration
+composer test
 ```
 
-### Error Contexts
+Integration tests use `TF_SQL_TEST_HOST`, `TF_SQL_TEST_PORT`,
+`TF_SQL_TEST_DATABASE`, `TF_SQL_TEST_USER`, and `TF_SQL_TEST_PASSWORD`. The
+database name must contain `test`; the suite creates and removes only uniquely
+named disposable tables.
 
-| Context | Triggered By |
-|---------|--------------|
-| `_create` | Insert failures |
-| `_update` | Update failures |
-| `_delete` | Delete failures |
-
-## Static Accessors
-
-```php
-User::primaryKey();    // "id"
-User::tableName();     // "users"
-User::databaseName();  // "myapp"
-User::tableFields();   // ["id", "name", "email", ...]
-```
-
-## Complete Example
-
-```php
-use TimeFrontiers\Helper\DatabaseObject;
-use TimeFrontiers\Helper\HasErrors;
-use TimeFrontiers\SQLDatabase;
-
-class Product {
-  use DatabaseObject, HasErrors;
-
-  protected static string $_db_name = 'store';
-  protected static string $_table_name = 'products';
-  protected static string $_primary_key = 'id';
-  protected static array $_db_fields = [];
-
-  public int $id;
-  public string $name;
-  public string $sku;
-  public float $price;
-  public int $stock = 0;
-  public string $status = 'draft';
-  protected ?string $_created = null;
-  protected ?string $_updated = null;
-  protected ?string $_author = null;
-
-  public ?string $description = null;
-
-  public function __construct() {
-    $this->empty_props = ['description'];  // see "Empty Properties" above
-  }
-
-  /**
-   * Publish the product.
-   */
-  public function publish():bool {
-    if ($this->stock <= 0) {
-      $this->_userError('publish', 'Cannot publish product with no stock');
-      return false;
-    }
-
-    $this->status = 'published';
-    return $this->save();
-  }
-
-  /**
-   * Find products low on stock.
-   */
-  public static function findLowStock(int $threshold = 10):array {
-    return static::query()
-      ->where('status', 'published')
-      ->where('stock', '<=', $threshold)
-      ->orderBy('stock')
-      ->get();
-  }
-}
-
-// Usage
-Product::useConnection($database);
-
-// Create
-$product = new Product();
-$product->name = 'Widget';
-$product->sku = 'WDG-001';
-$product->price = 29.99;
-$product->stock = 100;
-
-if ($product->save()) {
-  $product->publish();
-}
-
-// Query
-$lowStock = Product::findLowStock(5);
-
-foreach ($lowStock as $item) {
-  echo "{$item->name}: {$item->stock} remaining\n";
-}
-```
+See [UPGRADING.md](UPGRADING.md) before moving a 1.0 consumer to 1.1.
 
 ## License
 
-MIT License
+MIT License.

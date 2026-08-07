@@ -4,16 +4,11 @@ declare(strict_types=1);
 
 namespace TimeFrontiers\Helper;
 
-use TimeFrontiers\{SQLDatabase, AccessGroup};
 use TimeFrontiers\Database\QueryBuilder;
 use TimeFrontiers\Database\Schema\TableSchema;
-
-use function TimeFrontiers\{
-  get_constant,
-  get_dbuser,
-  get_dbserver,
-  get_database
-};
+use TimeFrontiers\Exceptions\{DatabaseException, SchemaException};
+use TimeFrontiers\Internal\{ImportsConnectionErrors, SqlIdentifier};
+use TimeFrontiers\{AccessGroup, SQLDatabase};
 
 /**
  * Database Object trait for Active Record pattern.
@@ -31,7 +26,7 @@ use function TimeFrontiers\{
  *
  * Usage:
  *   class User {
- *     use DatabaseObject, HasErrors;
+ *     use DatabaseObject;
  *
  *     protected static string $_db_name = 'myapp';
  *     protected static string $_table_name = 'users';
@@ -48,7 +43,7 @@ use function TimeFrontiers\{
  */
 trait DatabaseObject {
 
-  use HasErrors;
+  use HasErrors, ImportsConnectionErrors;
 
   // Connection (instance override or static fallback)
   protected ?SQLDatabase $_instance_conn = null;
@@ -56,6 +51,7 @@ trait DatabaseObject {
 
   // Schema cache
   protected static ?TableSchema $_schema = null;
+  private static ?object $_schema_connection = null;
 
   // Properties that can be set to empty values
   public array $empty_props = [];
@@ -148,19 +144,71 @@ trait DatabaseObject {
    * @return SQLDatabase
    */
   protected static function _upgradeConn(SQLDatabase|null $conn = null, AccessGroup $access_group = AccessGroup::USER):SQLDatabase {
-    if ($conn && $conn instanceof SQLDatabase) {
-      if (!\str_ends_with($conn->getUser(), "GUEST")) return $conn;
+    $current = $conn;
+    if ($current === null && static::_hasConnection()) {
+      $current = static::_getStaticConnection();
     }
-    $server_name = get_constant("PRJ_SERVER_NAME");
-    $db_user = get_dbuser($server_name, $access_group->value);
-    $db_server = get_dbserver($server_name);
-    // try to create connection
+
+    if ($current instanceof SQLDatabase) {
+      $user = \strtoupper((string)$current->getUser());
+      if (!\str_ends_with($user, 'GUEST')) {
+        return $current;
+      }
+
+      if ($current->inTransaction()) {
+        throw new \LogicException(
+          'Acquire the required database connection before beginning the transaction.'
+        );
+      }
+    }
+
+    [$db_server, $db_user, $db_password] = static::_resolveUpgradeConnectionSettings($access_group);
+
     try {
-      $conn = new SQLDatabase($db_server, $db_user[0], $db_user[1], static::$_db_name, true);
-    } catch (\Throwable $th) {
-      throw new \Exception("Failed to create database connection upgrade: {$th->getMessage()}", 1);
+      return new SQLDatabase($db_server, $db_user, $db_password, static::$_db_name, true);
+    } catch (\Throwable) {
+      throw new \RuntimeException('Failed to create the upgraded database connection.');
     }
-    return $conn;
+  }
+
+  /**
+   * Resolve Linktude bootstrap connection settings.
+   *
+   * @return array{string, string, string}
+   */
+  protected static function _resolveUpgradeConnectionSettings(AccessGroup $access_group):array {
+    foreach (['get_constant', 'get_dbuser', 'get_dbserver'] as $helper) {
+      if (!\function_exists($helper)) {
+        throw new \RuntimeException(
+          'Linktude database bootstrap helpers are unavailable.'
+        );
+      }
+    }
+
+    try {
+      $server_name = \get_constant('PRJ_SERVER_NAME');
+      if (!\is_string($server_name) || $server_name === '') {
+        throw new \RuntimeException();
+      }
+
+      $credentials = \get_dbuser($server_name, $access_group->value);
+      $server = \get_dbserver($server_name);
+    } catch (\Throwable) {
+      throw new \RuntimeException('Linktude database bootstrap configuration is invalid.');
+    }
+
+    if (
+      !\is_array($credentials)
+      || !isset($credentials[0], $credentials[1])
+      || !\is_string($credentials[0])
+      || !\is_string($credentials[1])
+      || !\is_string($server)
+      || $server === ''
+    ) {
+      throw new \RuntimeException('Linktude database bootstrap configuration is invalid.');
+    }
+
+    return [$server, $credentials[0], $credentials[1]];
   }
 
   // =========================================================================
@@ -171,14 +219,20 @@ trait DatabaseObject {
    * Get the table schema.
    */
   protected function _getSchema():TableSchema {
-    if (static::$_schema === null) {
-      static::$_schema = new TableSchema(
-        $this->_getConnection(),
-        static::$_db_name,
-        static::$_table_name,
-        static::$_primary_key ?? null
-      );
-    }
+    return static::_getSchemaForConnection($this->_getConnection());
+  }
+
+  /**
+   * Get the table schema for an exact connection.
+   */
+  protected static function _getSchemaForConnection(SQLDatabase $conn):TableSchema {
+    static::$_schema = new TableSchema(
+      $conn,
+      static::$_db_name,
+      static::$_table_name,
+      static::$_primary_key ?? null
+    );
+    static::$_schema_connection = $conn->getInstance();
 
     return static::$_schema;
   }
@@ -187,11 +241,18 @@ trait DatabaseObject {
    * Get field list (lazy-loaded).
    */
   protected function _getFields():array {
-    if (empty(static::$_db_fields)) {
-      static::$_db_fields = $this->_getSchema()->getFields();
+    return static::_resolveFields($this->_getConnection());
+  }
+
+  /**
+   * Resolve declared or lazily discovered fields for an exact connection.
+   */
+  protected static function _resolveFields(SQLDatabase $conn):array {
+    if (!empty(static::$_db_fields)) {
+      return static::$_db_fields;
     }
 
-    return static::$_db_fields;
+    return static::_getSchemaForConnection($conn)->getFields();
   }
 
   // =========================================================================
@@ -211,7 +272,7 @@ trait DatabaseObject {
   }
 
   public static function tableFields():array {
-    return static::$_db_fields;
+    return static::_resolveFields(static::_getStaticConnection());
   }
 
   // =========================================================================
@@ -233,9 +294,9 @@ trait DatabaseObject {
   /**
    * Find all records.
    *
-   * @return array<static>
+   * @return array<static>|false
    */
-  public static function findAll():array {
+  public static function findAll():array|false {
     return static::query()->get();
   }
 
@@ -245,7 +306,9 @@ trait DatabaseObject {
    * @return static|false
    */
   public static function findById(int|string $id):static|false {
-    if (\in_array("code", static::$_db_fields)) {
+    $fields = static::_resolveFields(static::_getStaticConnection());
+
+    if (\in_array('code', $fields, true)) {
       return static::query()
         ->where(static::$_primary_key, $id)
         ->orWhere("code", $id)
@@ -271,9 +334,21 @@ trait DatabaseObject {
     $conn = static::_getStaticConnection();
 
     // Replace placeholders
-    $sql = \str_replace([':database:', ':db:'], static::$_db_name, $sql);
-    $sql = \str_replace([':table:', ':tbl:'], static::$_table_name, $sql);
-    $sql = \str_replace([':primary_key:', ':pkey:'], static::$_primary_key, $sql);
+    $sql = \str_replace(
+      [':database:', ':db:'],
+      SqlIdentifier::quote(static::$_db_name),
+      $sql
+    );
+    $sql = \str_replace(
+      [':table:', ':tbl:'],
+      SqlIdentifier::quote(static::$_table_name),
+      $sql
+    );
+    $sql = \str_replace(
+      [':primary_key:', ':pkey:'],
+      SqlIdentifier::quote(static::$_primary_key),
+      $sql
+    );
 
     $rows = $conn->fetchAll($sql, $params);
     if ($rows === false) {
@@ -284,7 +359,7 @@ trait DatabaseObject {
       return [];
     }
 
-    return \array_map(fn($row) => static::_instantiateFromRow($row), $rows);
+    return \array_map(fn($row) => static::_instantiateFromRow($row, $conn), $rows);
   }
 
   /**
@@ -299,7 +374,7 @@ trait DatabaseObject {
   /**
    * Count all records.
    */
-  public static function countAll():int {
+  public static function countAll():int|false {
     return static::query()->count();
   }
 
@@ -309,6 +384,9 @@ trait DatabaseObject {
 
   /**
    * Save the entity (insert or update).
+   *
+   * A populated primary key always routes to update. Inserts with preassigned
+   * keys belong in explicit repository SQL.
    */
   public function save():bool {
     $pkey = static::$_primary_key;
@@ -393,26 +471,31 @@ trait DatabaseObject {
       }
     }
 
-    $attributes = $this->_getSanitizedAttributes();
-
-    if (empty($attributes)) {
-      $this->_userError('_create', 'No data to insert');
-      return false;
-    }
-
-    $columns = \array_keys($attributes);
-    $placeholders = \array_fill(0, \count($columns), '?');
-
-    $sql = \sprintf(
-      "INSERT INTO `%s`.`%s` (`%s`) VALUES (%s)",
-      static::$_db_name,
-      static::$_table_name,
-      \implode('`, `', $columns),
-      \implode(', ', $placeholders)
-    );
-
+    $error_snapshot = $this->_snapshotConnectionErrors($conn);
     try {
-      $conn->execute($sql, \array_values($attributes));
+      $attributes = $this->_getSanitizedAttributes();
+
+      if (empty($attributes)) {
+        $this->_userError('_create', 'No data to insert');
+        return false;
+      }
+
+      $columns = \array_keys($attributes);
+      $placeholders = \array_fill(0, \count($columns), '?');
+      $quoted_columns = \array_map(SqlIdentifier::quote(...), $columns);
+      $table = SqlIdentifier::quoteTable(static::$_db_name, static::$_table_name);
+
+      $sql = \sprintf(
+        'INSERT INTO %s (%s) VALUES (%s)',
+        $table,
+        \implode(', ', $quoted_columns),
+        \implode(', ', $placeholders)
+      );
+
+      if ($conn->execute($sql, \array_values($attributes)) === false) {
+        $this->_importConnectionErrorDelta($conn, $error_snapshot, '_create');
+        return false;
+      }
 
       // Set auto-increment ID if applicable
       $pkey = static::$_primary_key;
@@ -424,8 +507,16 @@ trait DatabaseObject {
       }
 
       return true;
-    } catch (\Exception $e) {
-      $this->_systemError('_create', $e->getMessage());
+    } catch (SchemaException) {
+      $this->_importConnectionErrorDelta(
+        $conn,
+        $error_snapshot,
+        '_create',
+        'Database schema discovery failed.'
+      );
+      return false;
+    } catch (DatabaseException) {
+      $this->_importConnectionErrorDelta($conn, $error_snapshot, '_create');
       return false;
     }
   }
@@ -444,43 +535,55 @@ trait DatabaseObject {
       $this->_updated = \date('Y-m-d H:i:s');
     }
 
-    $attributes = $this->_getSanitizedAttributes();
-
-    if (empty($attributes)) {
-      $this->_userError('_update', 'No data to update');
-      return false;
-    }
-
-    $setPairs = [];
-    $params = [];
-
-    foreach ($attributes as $column => $value) {
-      if ($value === null) {
-        $setPairs[] = "`{$column}` = NULL";
-      } else {
-        $setPairs[] = "`{$column}` = ?";
-        $params[] = $value;
-      }
-    }
-
-    $params[] = $this->$pkey;
-
-    $sql = \sprintf(
-      "UPDATE `%s`.`%s` SET %s WHERE `%s` = ?",
-      static::$_db_name,
-      static::$_table_name,
-      \implode(', ', $setPairs),
-      $pkey
-    );
-
+    $error_snapshot = $this->_snapshotConnectionErrors($conn);
     try {
-      $conn->execute($sql, $params);
-      $affected = $conn->affectedRows();
+      $attributes = $this->_getSanitizedAttributes();
+
+      if (empty($attributes)) {
+        $this->_userError('_update', 'No data to update');
+        return false;
+      }
+
+      $setPairs = [];
+      $params = [];
+
+      foreach ($attributes as $column => $value) {
+        $quoted_column = SqlIdentifier::quote($column);
+        if ($value === null) {
+          $setPairs[] = "{$quoted_column} = NULL";
+        } else {
+          $setPairs[] = "{$quoted_column} = ?";
+          $params[] = $value;
+        }
+      }
+
+      $params[] = $this->$pkey;
+      $table = SqlIdentifier::quoteTable(static::$_db_name, static::$_table_name);
+      $primary_key = SqlIdentifier::quote($pkey);
+      $sql = \sprintf(
+        'UPDATE %s SET %s WHERE %s = ?',
+        $table,
+        \implode(', ', $setPairs),
+        $primary_key
+      );
+
+      if ($conn->execute($sql, $params) === false) {
+        $this->_importConnectionErrorDelta($conn, $error_snapshot, '_update');
+        return false;
+      }
 
       // 0 rows affected could mean no changes, not necessarily an error
-      return $affected >= 0;
-    } catch (\Exception $e) {
-      $this->_systemError('_update', $e->getMessage());
+      return $conn->affectedRows() >= 0;
+    } catch (SchemaException) {
+      $this->_importConnectionErrorDelta(
+        $conn,
+        $error_snapshot,
+        '_update',
+        'Database schema discovery failed.'
+      );
+      return false;
+    } catch (DatabaseException) {
+      $this->_importConnectionErrorDelta($conn, $error_snapshot, '_update');
       return false;
     }
   }
@@ -494,18 +597,19 @@ trait DatabaseObject {
       return false;
     }
 
-    $sql = \sprintf(
-      "DELETE FROM `%s`.`%s` WHERE `%s` = ? LIMIT 1",
-      static::$_db_name,
-      static::$_table_name,
-      $pkey
-    );
-
+    $table = SqlIdentifier::quoteTable(static::$_db_name, static::$_table_name);
+    $primary_key = SqlIdentifier::quote($pkey);
+    $sql = "DELETE FROM {$table} WHERE {$primary_key} = ? LIMIT 1";
+    $error_snapshot = $this->_snapshotConnectionErrors($conn);
     try {
-      $conn->execute($sql, [$this->$pkey]);
+      if ($conn->execute($sql, [$this->$pkey]) === false) {
+        $this->_importConnectionErrorDelta($conn, $error_snapshot, '_delete');
+        return false;
+      }
+
       return $conn->affectedRows() === 1;
-    } catch (\Exception $e) {
-      $this->_systemError('_delete', $e->getMessage());
+    } catch (DatabaseException) {
+      $this->_importConnectionErrorDelta($conn, $error_snapshot, '_delete');
       return false;
     }
   }
@@ -517,8 +621,8 @@ trait DatabaseObject {
   /**
    * Get object attributes that map to database fields.
    */
-  protected function _getAttributes():array {
-    $fields = $this->_getFields();
+  protected function _getAttributes(?array $fields = null):array {
+    $fields ??= $this->_getFields();
     $attributes = [];
 
     foreach ($fields as $field) {
@@ -535,12 +639,13 @@ trait DatabaseObject {
    */
   protected function _getSanitizedAttributes():array {
     $schema = $this->_getSchema();
-    $attributes = $this->_getAttributes();
+    $fields = !empty(static::$_db_fields) ? static::$_db_fields : $schema->getFields();
+    $attributes = $this->_getAttributes($fields);
     $sanitized = [];
 
     foreach ($attributes as $field => $value) {
       // Skip empty values unless allowed
-      if ($this->_isEmpty($field, $value) && !\in_array($field, $this->empty_props, true)) {
+      if ($this->_isEmpty($field, $value, $schema) && !\in_array($field, $this->empty_props, true)) {
         continue;
       }
 
@@ -550,7 +655,7 @@ trait DatabaseObject {
       } elseif ($value === null) {
         // Explicit null always stays null regardless of column type
         $sanitized[$field] = null;
-      } elseif ($this->_isEmpty($field, $value) && \in_array($field, $this->empty_props, true)) {
+      } elseif ($this->_isEmpty($field, $value, $schema) && \in_array($field, $this->empty_props, true)) {
         // Empty (but not null) whitelisted field — coerce to safe default for type
         if ($schema->isDateTime($field) || $schema->isText($field)) {
           $sanitized[$field] = null;
@@ -570,8 +675,8 @@ trait DatabaseObject {
   /**
    * Check if a value is empty for its field type.
    */
-  protected function _isEmpty(string $field, mixed $value):bool {
-    $schema = $this->_getSchema();
+  protected function _isEmpty(string $field, mixed $value, ?TableSchema $schema = null):bool {
+    $schema ??= $this->_getSchema();
 
     if ($schema->isNumeric($field)) {
       return \strlen((string) $value) === 0;
@@ -596,12 +701,13 @@ trait DatabaseObject {
    * Create instance from database row.
    * Called by QueryBuilder and findBySql.
    */
-  public static function _instantiateFromRow(array $row):static {
+  public static function _instantiateFromRow(array $row, ?SQLDatabase $conn = null):static {
+    $conn ??= static::_getStaticConnection();
     $instance = new static(
       static::$_db_name,
       static::$_table_name,
       static::$_primary_key,
-      static::_getStaticConnection()
+      $conn
     );
 
     foreach ($row as $key => $value) {
@@ -609,6 +715,8 @@ trait DatabaseObject {
         $instance->$key = $value;
       }
     }
+
+    $instance->setConnection($conn);
 
     return $instance;
   }
