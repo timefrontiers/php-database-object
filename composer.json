@@ -13,7 +13,7 @@
   ],
   "require": {
     "php": ">=8.4",
-    "timefrontiers/php-sql-database": "^2.0",
+    "timefrontiers/php-sql-database": "^1.1",
     "timefrontiers/php-has-errors": "^1.0"
   },
   "require-dev": {
