@@ -4,13 +4,13 @@ Active Record infrastructure for SQL Database 1.1, with schema-aware writes,
 prepared fluent queries, explicit connection injection, and ecosystem-standard
 `HasErrors` diagnostics.
 
-[![PHP Version](https://img.shields.io/badge/php-%3E%3D8.4-8892BF.svg)](https://php.net/)
-[![Release](https://img.shields.io/badge/release-1.1.0-blue.svg)](CHANGELOG.md)
+[![PHP Version](https://img.shields.io/badge/php-%3E%3D8.5-8892BF.svg)](https://php.net/)
+[![Release](https://img.shields.io/badge/release-1.1.1-blue.svg)](CHANGELOG.md)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
 ## Requirements
 
-- PHP 8.4+
+- PHP 8.5+
 - `timefrontiers/php-core` 1.x
 - `timefrontiers/php-has-errors` 1.x
 - `timefrontiers/php-sql-database` 1.1.x

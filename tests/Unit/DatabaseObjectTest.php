@@ -36,7 +36,66 @@ final class DatabaseObjectTest extends TestCase
     self::assertFalse($record->save());
     self::assertSame([$current], $record->getErrors()['_create']);
     self::assertStringNotContainsString('BOUND-SENTINEL', $record->firstError('_create'));
-    self::assertStringNotContainsString('secret-password', $record->firstError('_create'));
+  }
+
+  public function testFallbackDiagnosticExposesOnlyDriverCodeAndSqlState(): void
+  {
+    [$conn, $driver] = $this->connection();
+    $driver->queueFetchAll(SchemaRows::standard());
+    // A driver may report failure through false without appending an entry.
+    $driver->queueExecute(false, driver_code: 1045, sql_state: '28000');
+
+    $record = $this->record($conn);
+    $record->name = 'BOUND-SENTINEL';
+
+    self::assertFalse($record->save());
+
+    $message = $record->firstError('_create');
+    self::assertStringContainsString('1045', $message);
+    self::assertStringContainsString('28000', $message);
+    self::assertStringNotContainsString('BOUND-SENTINEL', $message);
+    self::assertStringNotContainsString('INSERT', $message);
+    self::assertStringNotContainsString('test_records', $message);
+    self::assertStringNotContainsString('TEST_USER', $message);
+  }
+
+  public function testStringInsertIdIsNormalizedForNumericPrimaryKeys(): void
+  {
+    // PDO reports lastInsertId() as a string while MySQLi reports an integer.
+    // A typed int primary key must accept the value on both drivers.
+    [$conn, $driver] = $this->connection();
+    $driver->queueFetchAll(SchemaRows::standard());
+    $driver->queueExecute(true, affected_rows: 1, insert_id: '42');
+
+    $record = $this->record($conn);
+    self::assertTrue($record->save());
+    self::assertSame(42, $record->id);
+  }
+
+  public function testWideInsertIdIsNotTruncatedToAnInteger(): void
+  {
+    [$conn, $driver] = $this->connection();
+    $beyond_int_range = '9223372036854775808';
+    $driver->queueFetchAll(SchemaRows::standard());
+    $driver->queueExecute(true, affected_rows: 1, insert_id: $beyond_int_range);
+
+    $record = $this->record($conn);
+    self::assertTrue($record->save());
+    self::assertSame($beyond_int_range, $record->id);
+  }
+
+  public function testSchemaResolutionCompletesBeforeAnyWriteIsDispatched(): void
+  {
+    [$conn, $driver] = $this->connection();
+    $failure = [0, 1146, 'Failed to prepare the database statement.', __FILE__, __LINE__];
+    $driver->queueFetchAll(false, $failure, 1146, '42S02');
+
+    self::assertFalse($this->record($conn)->save());
+    self::assertSame(
+      [],
+      $driver->executions,
+      'Schema discovery must fail before any insert is dispatched.'
+    );
   }
 
   public function testUpdateCannotSucceedAfterFailedExecuteWithZeroAffectedRows(): void

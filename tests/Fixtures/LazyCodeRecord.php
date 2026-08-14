@@ -25,8 +25,6 @@ final class LazyCodeRecord
 
   public static function resetFixture(): void
   {
-    static::$_schema = null;
-    static::$_schema_connection = null;
     static::$_static_conn = null;
   }
 }

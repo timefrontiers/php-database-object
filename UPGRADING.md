@@ -4,6 +4,18 @@ Version 1.1 aligns Database Object with SQL Database 1.1 false-result and
 transaction semantics. Review every item below before changing the Composer
 constraint.
 
+## Required action in 1.1.1: PHP 8.5
+
+**1.1.1 raises the minimum PHP version from 8.4 to 8.5.** Despite being a patch
+number, it is not installable on PHP 8.4. Confirm the runtime before upgrading:
+
+```bash
+php -v
+```
+
+A consumer that cannot move to PHP 8.5 must pin `1.1.0` explicitly rather than
+`^1.1`. Everything else in this guide applies to the whole 1.1 line.
+
 ## Dependencies
 
 Require the coordinated 1.1 line:
@@ -12,9 +24,16 @@ Require the coordinated 1.1 line:
 composer require timefrontiers/php-database-object:^1.1
 ```
 
-The package requires PHP 8.4+, SQL Database 1.1, HasErrors 1.x, and PHP Core
+The package requires PHP 8.5+, SQL Database 1.1, HasErrors 1.x, and PHP Core
 1.x. PDO/PDO-MySQL remain optional integration capabilities rather than hard
 extension requirements.
+
+## Removed model schema properties (1.1.1)
+
+`DatabaseObject::$_schema` and `$_schema_connection` no longer exist. They were
+never read: metadata caching and its connection-identity isolation belong to
+`TableSchema`. Remove any subclass code that assigns or clears them — it was
+not affecting a cache — and use `TableSchema::clearCache()` instead.
 
 ## Check false results strictly
 
@@ -136,4 +155,3 @@ transaction.
 - Remove fluent raw expressions and unsupported operators.
 - Confirm every transaction-bound record receives the callback facade.
 - Run the unit, MySQLi, PDO, transaction, and full Composer suites.
-

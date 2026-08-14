@@ -30,8 +30,6 @@ final class IntegrationRecord
   {
     static::$_db_name = $database;
     static::$_table_name = $table;
-    static::$_schema = null;
-    static::$_schema_connection = null;
     static::useConnection($conn);
   }
 }

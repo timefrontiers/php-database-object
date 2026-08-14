@@ -49,10 +49,6 @@ trait DatabaseObject {
   protected ?SQLDatabase $_instance_conn = null;
   private static ?SQLDatabase $_static_conn = null;
 
-  // Schema cache
-  protected static ?TableSchema $_schema = null;
-  private static ?object $_schema_connection = null;
-
   // Properties that can be set to empty values
   public array $empty_props = [];
 
@@ -224,17 +220,17 @@ trait DatabaseObject {
 
   /**
    * Get the table schema for an exact connection.
+   *
+   * Metadata caching, including its connection-identity isolation, belongs to
+   * TableSchema. This method deliberately keeps no model-level schema state.
    */
   protected static function _getSchemaForConnection(SQLDatabase $conn):TableSchema {
-    static::$_schema = new TableSchema(
+    return new TableSchema(
       $conn,
       static::$_db_name,
       static::$_table_name,
       static::$_primary_key ?? null
     );
-    static::$_schema_connection = $conn->getInstance();
-
-    return static::$_schema;
   }
 
   /**
@@ -492,18 +488,20 @@ trait DatabaseObject {
         \implode(', ', $placeholders)
       );
 
+      // Resolve every schema-dependent decision before the mutation. Schema
+      // discovery after a committed insert could otherwise report a successful
+      // write as a failure and invite a duplicating retry.
+      $pkey = static::$_primary_key;
+      $assign_insert_id = \property_exists($this, $pkey)
+        && $this->_getSchema()->isNumeric($pkey);
+
       if ($conn->execute($sql, \array_values($attributes)) === false) {
         $this->_importConnectionErrorDelta($conn, $error_snapshot, '_create');
         return false;
       }
 
-      // Set auto-increment ID if applicable
-      $pkey = static::$_primary_key;
-      if (\property_exists($this, $pkey)) {
-        $schema = $this->_getSchema();
-        if ($schema->isNumeric($pkey)) {
-          $this->$pkey = $conn->insertId();
-        }
+      if ($assign_insert_id) {
+        $this->$pkey = static::_normalizeInsertId($conn->insertId());
       }
 
       return true;
@@ -617,6 +615,25 @@ trait DatabaseObject {
   // =========================================================================
   // Attribute Handling
   // =========================================================================
+
+  /**
+   * Normalize a driver insert ID for a numeric primary-key property.
+   *
+   * MySQLi reports the value as an integer while PDO reports the same value as
+   * a string. An integral value inside PHP's integer range is returned as an
+   * int so a typed `int`/`?int` primary key accepts it on both drivers. A value
+   * beyond that range is returned unchanged so a wide BIGINT key is never
+   * silently truncated.
+   */
+  protected static function _normalizeInsertId(int|string $insert_id):int|string {
+    if (\is_int($insert_id)) {
+      return $insert_id;
+    }
+
+    $candidate = \filter_var($insert_id, \FILTER_VALIDATE_INT);
+
+    return $candidate === false ? $insert_id : $candidate;
+  }
 
   /**
    * Get object attributes that map to database fields.
